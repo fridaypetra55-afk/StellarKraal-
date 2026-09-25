@@ -1,11 +1,17 @@
 "use client";
 
 import { useState } from "react";
+import dynamic from "next/dynamic";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import LiquidationWarningModal from "@/components/LiquidationWarningModal";
 import ShortcutsHelpModal from "@/components/ShortcutsHelpModal";
-import OnboardingModal from "@/components/OnboardingModal";
 import Modal from "@/components/ui/Modal";
+
+// Heavy component — loaded lazily to reduce initial JS bundle (#1070)
+const OnboardingModal = dynamic(() => import("@/components/OnboardingModal"), {
+  ssr: false,
+  loading: () => null,
+});
 
 export default function A11yModalsTest() {
   const [activeModal, setActiveModal] = useState<string | null>(null);

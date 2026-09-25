@@ -1,9 +1,15 @@
 "use client";
 
 import { useState } from "react";
-import OnboardingModal from "@/components/OnboardingModal";
+import dynamic from "next/dynamic";
 import HelpMenu from "@/components/HelpMenu";
 import { useOnboarding } from "@/hooks/useOnboarding";
+
+// Heavy component — loaded lazily to reduce initial JS bundle (#1070)
+const OnboardingModal = dynamic(() => import("@/components/OnboardingModal"), {
+  ssr: false,
+  loading: () => null,
+});
 
 export default function OnboardingDemo() {
   const { showOnboarding, openOnboarding, closeOnboarding } = useOnboarding();

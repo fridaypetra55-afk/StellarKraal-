@@ -13,6 +13,7 @@
     "migrate:dev": "db-migrate up --config database.json --env dev",
     "migrate:prod": "db-migrate up --config database.json --env production",
     "migrate:down": "db-migrate down --config database.json --env dev",
+    "migrate:status": "db-migrate check --config database.json --env dev",
     "migrate:check": "db-migrate check --config database.json --env dev",
     "migrate:create": "db-migrate create --config database.json --sql-file",
     "migrate:reset": "db-migrate reset --config database.json --env dev",

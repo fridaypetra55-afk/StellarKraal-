@@ -1,10 +1,23 @@
 "use client";
 import { useState } from "react";
-import WalletConnect from "@/components/WalletConnect";
-import CollateralRegistrationForm from "@/components/CollateralRegistrationForm";
+import dynamic from "next/dynamic";
 import LoanForm from "@/components/LoanForm";
 import PageTransition from "@/components/PageTransition";
 import { Hero } from "@/components/Hero";
+import Spinner from "@/components/Spinner";
+
+// Heavy components loaded lazily to reduce initial JS bundle (#1070)
+const WalletConnect = dynamic(() => import("@/components/WalletConnect"), {
+  ssr: false,
+  loading: () => <Spinner />,
+});
+const CollateralRegistrationForm = dynamic(
+  () => import("@/components/CollateralRegistrationForm"),
+  {
+    ssr: false,
+    loading: () => <Spinner />,
+  },
+);
 
 export default function BorrowClient() {
   const [wallet, setWallet] = useState<string | null>(null);

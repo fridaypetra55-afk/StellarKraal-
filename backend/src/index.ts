@@ -893,7 +893,7 @@ app.get('/api/loan/:id', readLimiter, async (req: Request, res: Response, next: 
 });
 
 // GET /api/health/:loanId
-app.get('/api/health/:loanId', async (req: Request, res: Response, next: NextFunction) => {
+app.get('/api/health/:loanId', readLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const contract = new Contract(CONTRACT_ID);
     const account = await rpcClient.getAccount(
@@ -1032,12 +1032,12 @@ app.post(
 );
 
 // GET /api/admin/webhooks — list registered webhooks
-app.get('/api/admin/webhooks', (req: Request, res: Response) => {
+app.get('/api/admin/webhooks', readLimiter, (req: Request, res: Response) => {
   res.json(getWebhooks());
 });
 
 // GET /api/admin/webhooks/logs — delivery logs
-app.get('/api/admin/webhooks/logs', (req: Request, res: Response) => {
+app.get('/api/admin/webhooks/logs', readLimiter, (req: Request, res: Response) => {
   res.json(getDeliveryLogs());
 });
 

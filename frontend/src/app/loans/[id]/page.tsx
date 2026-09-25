@@ -2,9 +2,18 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
+import dynamic from 'next/dynamic';
 import ErrorState from '@/components/ErrorState';
 import DetailSkeleton from '@/components/DetailSkeleton';
-import LoanRepaymentCalculator from '@/components/LoanRepaymentCalculator';
+
+// Heavy component — loaded lazily to reduce initial JS bundle (#1070)
+const LoanRepaymentCalculator = dynamic(
+  () => import('@/components/LoanRepaymentCalculator'),
+  {
+    ssr: false,
+    loading: () => <DetailSkeleton />,
+  },
+);
 
 interface LoanRecord {
   id: string;

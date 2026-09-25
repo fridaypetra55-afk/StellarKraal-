@@ -1,4 +1,11 @@
 /** @type {import('next').NextConfig} */
+
+// Bundle analyzer — run with ANALYZE=true npm run build to generate bundle reports.
+// Closes #1070: bundle code splitting audit.
+const withBundleAnalyzer = require("@next/bundle-analyzer")({
+  enabled: process.env.ANALYZE === "true",
+});
+
 const nextConfig = {
   output: "standalone",
   eslint: {
@@ -20,4 +27,4 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+module.exports = withBundleAnalyzer(nextConfig);

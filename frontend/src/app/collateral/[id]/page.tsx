@@ -3,14 +3,26 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { useParams } from "next/navigation";
-import { PriceChart } from "@/components/PriceChart";
+import dynamic from "next/dynamic";
 import Sparkline from "@/components/Sparkline";
 import ErrorState from "@/components/ErrorState";
 import DetailSkeleton from "@/components/DetailSkeleton";
 import CollateralLocationSection from "@/components/CollateralLocationSection";
 import LiquidationThresholdBadge from "@/components/LiquidationThresholdBadge";
-import TransactionHistory from "@/components/TransactionHistory";
 import { formatXlmNumber } from "@/lib/formatMoney";
+
+// Heavy components — loaded lazily to reduce initial JS bundle (#1070)
+const PriceChart = dynamic(
+  () => import("@/components/PriceChart").then((m) => ({ default: m.PriceChart })),
+  {
+    ssr: false,
+    loading: () => <DetailSkeleton />,
+  },
+);
+const TransactionHistory = dynamic(() => import("@/components/TransactionHistory"), {
+  ssr: false,
+  loading: () => <DetailSkeleton />,
+});
 
 interface AppraisalEntry {
   date: string;
