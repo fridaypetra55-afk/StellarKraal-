@@ -93,6 +93,15 @@ const MIN_LOAN: Symbol = symbol_short!("MINLOAN"); // minimum loan amount in str
 const MAX_LOAN: Symbol = symbol_short!("MAXLOAN"); // maximum loan amount in stroops
 const MAX_EXTENSIONS: Symbol = symbol_short!("MAXEXT");
 
+// ── Collateral + cooldown storage keys ───────────────────────────────────────
+const MIN_COLLATERAL: Symbol = symbol_short!("MINCOLL"); // minimum collateral value
+const LOAN_COOLDOWN: Symbol = symbol_short!("LNCOOLDWN"); // ledgers between requests
+
+// ── TWAP ring-buffer storage keys (#1042) ─────────────────────────────────────
+const TWAP_BUF: Symbol = symbol_short!("TWAP_BUF"); // ring-buffer head index
+const TWAP_LEN: Symbol = symbol_short!("TWAP_LEN"); // number of valid entries in ring buffer
+const TWAP_CAP: Symbol = symbol_short!("TWAP_CAP"); // ring-buffer capacity (default 60)
+
 // ── Issue #669 storage keys ──────────────────────────────────────────────────
 const PNDG_WASM: Symbol = symbol_short!("PNDGWASM");
 const UPG_TIME: Symbol = symbol_short!("UPGTIME");
@@ -118,6 +127,15 @@ pub const DEFAULT_MAX_LOAN: i128 = 1_000_000_000_000;
 
 /// Default maximum number of extensions allowed for one loan.
 pub const DEFAULT_MAX_EXTENSIONS: u32 = 3;
+
+/// Default minimum collateral appraised value (1,000 stroops).
+pub const DEFAULT_MIN_COLLATERAL: i128 = 1_000;
+
+/// Default cooldown between loan requests for the same borrower, in ledgers.
+pub const DEFAULT_LOAN_COOLDOWN: u32 = 0;
+
+/// Default TWAP ring-buffer capacity (number of price observations stored).
+pub const DEFAULT_TWAP_CAP: u32 = 60;
 
 // ── TTL management ───────────────────────────────────────────────────────────
 
@@ -182,6 +200,12 @@ pub enum Error {
     ExtensionDenied = 29,
     /// The loan has reached the configured extension limit.
     ExtensionLimitReached = 30,
+    /// The collateral appraised value is below the protocol minimum.
+    CollateralValueTooLow = 27,
+    /// Another loan request was made too recently (cooldown period active).
+    CooldownActive = 28,
+    /// Insufficient TWAP data points to compute a reliable average.
+    InsufficientTwapData = 31,
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -313,6 +337,16 @@ pub struct PauseStatus {
     pub expires_at: Option<u64>,
 }
 
+/// A single (price, timestamp) observation stored in the TWAP ring buffer (#1042).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapEntry {
+    /// Oracle price in the protocol token's base unit.
+    pub price: i128,
+    /// Ledger timestamp of this observation.
+    pub timestamp: u64,
+}
+
 // ── Storage helpers ──────────────────────────────────────────────────────────
 
 /// Persistent storage keys used by the contract.
@@ -338,6 +372,10 @@ pub enum DataKey {
     PendingWasm,
     /// Ledger timestamp when an upgrade was proposed (issue #669).
     UpgradeTime,
+    /// Last loan request ledger sequence for a borrower (used for cooldown).
+    LastLoanRequest(Address),
+    /// A single entry in the TWAP ring buffer, indexed by slot position.
+    TwapSlot(u32),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -430,6 +468,13 @@ impl StellarKraal {
         env.storage().instance().set(&MIN_LOAN, &DEFAULT_MIN_LOAN);
         env.storage().instance().set(&MAX_LOAN, &DEFAULT_MAX_LOAN);
         env.storage().instance().set(&MAX_EXTENSIONS, &DEFAULT_MAX_EXTENSIONS);
+        // Issue #1039/#1041: min collateral + loan cooldown
+        env.storage().instance().set(&MIN_COLLATERAL, &DEFAULT_MIN_COLLATERAL);
+        env.storage().instance().set(&LOAN_COOLDOWN, &DEFAULT_LOAN_COOLDOWN);
+        // Issue #1042: TWAP ring buffer
+        env.storage().instance().set(&TWAP_BUF, &0u32); // head index
+        env.storage().instance().set(&TWAP_LEN, &0u32); // current length
+        env.storage().instance().set(&TWAP_CAP, &DEFAULT_TWAP_CAP);
         Ok(())
     }
 
@@ -550,18 +595,24 @@ impl StellarKraal {
             return Err(Error::AlreadyPaused);
         }
 
-        let duration: u64 = env.storage().instance().get(&PAUSE_DUR).unwrap_or(24 * 3600);
-        let expires_at = env.ledger().timestamp().checked_add(duration).ok_or(Error::ArithmeticOverflow)?;
-
+        let duration: u64 = env.storage().instance().get(&PAUSE_DUR).unwrap_or(0);
+        let (store_expiry, event_expiry) = if duration == 0 {
+            // Indefinite pause: store 0 (sentinel for "no expiry"), publish u64::MAX in event.
+            (0u64, u64::MAX)
+        } else {
+            let expires_at = env.ledger().timestamp().checked_add(duration).ok_or(Error::ArithmeticOverflow)?;
+            (expires_at, expires_at)
+        };
         env.storage().instance().set(&PAUSED, &true);
-        env.storage().instance().set(&PAUSE_EXP, &expires_at);
+        env.storage().instance().set(&PAUSE_EXP, &store_expiry);
+
         env.events().publish(
             (symbol_short!("Pause"), symbol_short!("activated")),
-            (admin.clone(), expires_at),
+            (admin.clone(), event_expiry),
         );
         env.events().publish(
             (Symbol::new(&env, "ContractPaused"),),
-            (admin, expires_at),
+            (admin, event_expiry),
         );
         Ok(())
     }
@@ -1062,6 +1113,14 @@ impl StellarKraal {
         }
         env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
         env.storage().persistent().extend_ttl(&DataKey::Loan(loan_id), PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_LEDGERS);
+
+        // Emit LoanPartiallyRepaid when principal is reduced but not fully cleared (#1041).
+        if loan.outstanding > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "LoanPartiallyRepaid"),),
+                (loan_id, borrower.clone(), principal_paid, loan.outstanding),
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "loan_repaid"), borrower.clone()),
@@ -1914,7 +1973,12 @@ impl StellarKraal {
     }
 
     // ── submit_price ──────────────────────────────────────────────────────
-    /// Submit a single price observation to update the TWAP.
+    /// Submit a single price observation.
+    ///
+    /// Prices are stored in a capped ring buffer of `(price, timestamp)` tuples
+    /// in persistent storage (ADR-007, issue #1042). The ring buffer overwrites
+    /// the oldest entry when full.  The legacy instance-storage TWAP fields are
+    /// still updated for backward compatibility with `get_twap_data`.
     pub fn submit_price(env: Env, oracle: Address, price: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
         oracle.require_auth();
@@ -1927,6 +1991,26 @@ impl StellarKraal {
         }
 
         let now = env.ledger().timestamp();
+
+        // ── Ring buffer write ─────────────────────────────────────────
+        let cap: u32 = env.storage().instance().get(&TWAP_CAP).unwrap_or(DEFAULT_TWAP_CAP);
+        let head: u32 = env.storage().instance().get(&TWAP_BUF).unwrap_or(0);
+        let len: u32 = env.storage().instance().get(&TWAP_LEN).unwrap_or(0);
+
+        let entry = TwapEntry { price, timestamp: now };
+        env.storage().persistent().set(&DataKey::TwapSlot(head), &entry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TwapSlot(head),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
+        let new_head = (head + 1) % cap;
+        let new_len = if len < cap { len + 1 } else { len };
+        env.storage().instance().set(&TWAP_BUF, &new_head);
+        env.storage().instance().set(&TWAP_LEN, &new_len);
+
+        // ── Legacy instance-storage fields (backward compat) ──────────
         let window: u64 = env.storage().instance().get(&TWAP_WINDOW).unwrap_or(3600);
         let last_time: u64 = env.storage().instance().get(&LAST_PRICE_TIME).unwrap_or(0);
 
@@ -1950,6 +2034,116 @@ impl StellarKraal {
             (price, twap, now),
         );
         Ok(())
+    }
+
+    // ── get_twap ──────────────────────────────────────────────────────────
+    /// Compute the time-weighted average price over `window_seconds` using
+    /// the ring buffer of price observations (ADR-007, issue #1042).
+    ///
+    /// Each observation is weighted by the duration it was the active price
+    /// (i.e. the time gap to the *next* observation, or to `now` for the most
+    /// recent entry).  Entries older than `window_seconds` from `now` are
+    /// excluded.
+    ///
+    /// Returns [`Error::InsufficientTwapData`] when fewer than 2 valid entries
+    /// exist within the window (a single observation cannot produce a
+    /// time-weighted average).
+    ///
+    /// # Arguments
+    /// * `window_seconds` – Look-back period in seconds. Pass `0` to use the
+    ///   configured default TWAP window.
+    pub fn get_twap(env: Env, window_seconds: u64) -> Result<i128, Error> {
+        Self::assert_initialized(&env)?;
+
+        let win = if window_seconds == 0 {
+            env.storage().instance().get(&TWAP_WINDOW).unwrap_or(3600)
+        } else {
+            window_seconds
+        };
+
+        let cap: u32 = env.storage().instance().get(&TWAP_CAP).unwrap_or(DEFAULT_TWAP_CAP);
+        let head: u32 = env.storage().instance().get(&TWAP_BUF).unwrap_or(0);
+        let len: u32 = env.storage().instance().get(&TWAP_LEN).unwrap_or(0);
+
+        if len == 0 {
+            return Err(Error::InsufficientTwapData);
+        }
+
+        let now = env.ledger().timestamp();
+        let cutoff = now.saturating_sub(win);
+
+        // Collect all entries within the window into a temporary sorted vec.
+        // The ring buffer slots are written oldest-first wrapping around, so
+        // we iterate from (head - len) mod cap to head.
+        let mut entries: Vec<TwapEntry> = Vec::new(&env);
+        for i in 0..len {
+            let slot = (head + cap - len + i) % cap;
+            if let Some(e) = env.storage().persistent().get::<_, TwapEntry>(&DataKey::TwapSlot(slot)) {
+                if e.timestamp >= cutoff {
+                    entries.push_back(e);
+                }
+            }
+        }
+
+        let n = entries.len();
+        if n < 2 {
+            return Err(Error::InsufficientTwapData);
+        }
+
+        // Compute time-weighted sum.  Weight of observation i = entries[i+1].timestamp - entries[i].timestamp
+        // Weight of last observation = now - entries[n-1].timestamp
+        let mut weighted_sum: i128 = 0i128;
+        let mut total_weight: i128 = 0i128;
+
+        for i in 0..n {
+            let entry = entries.get(i).unwrap();
+            let next_ts = if i + 1 < n {
+                entries.get(i + 1).unwrap().timestamp
+            } else {
+                now
+            };
+            let weight = next_ts.saturating_sub(entry.timestamp) as i128;
+            weighted_sum = weighted_sum
+                .checked_add(
+                    entry.price.checked_mul(weight).ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+            total_weight = total_weight.checked_add(weight).ok_or(Error::ArithmeticOverflow)?;
+        }
+
+        if total_weight == 0 {
+            return Err(Error::InsufficientTwapData);
+        }
+
+        Ok(weighted_sum / total_weight)
+    }
+
+    // ── set_twap_cap ──────────────────────────────────────────────────────
+    /// Update the TWAP ring-buffer capacity (admin-only, issue #1042).
+    ///
+    /// The capacity controls how many `(price, timestamp)` observations are
+    /// retained. Existing entries beyond the new cap will be naturally overwritten
+    /// by future submissions.
+    pub fn set_twap_cap(env: Env, admin: Address, cap: u32) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+        if cap == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let old_cap: u32 = env.storage().instance().get(&TWAP_CAP).unwrap_or(DEFAULT_TWAP_CAP);
+        env.storage().instance().set(&TWAP_CAP, &cap);
+        env.events().publish(
+            (symbol_short!("TWAP"), symbol_short!("capUpd")),
+            (old_cap, cap),
+        );
+        Ok(())
+    }
+
+    // ── get_twap_cap ──────────────────────────────────────────────────────
+    /// Return the current TWAP ring-buffer capacity.
+    pub fn get_twap_cap(env: Env) -> u32 {
+        env.storage().instance().get(&TWAP_CAP).unwrap_or(DEFAULT_TWAP_CAP)
     }
 
     // ── get_twap_data ─────────────────────────────────────────────────────
@@ -2062,6 +2256,135 @@ impl StellarKraal {
             env.ledger().timestamp(),
         );
         Ok(())
+    }
+
+    // ── accrue_interest ───────────────────────────────────────────────────
+    /// Accrue interest on an active loan up to the current ledger timestamp.
+    ///
+    /// Returns the amount of interest accrued in this call (0 if no time has
+    /// elapsed or the loan is not active).  The updated `interest_accrued`
+    /// field is stored back to persistent storage.
+    pub fn accrue_interest(env: Env, loan_id: u64) -> Result<i128, Error> {
+        Self::assert_initialized(&env)?;
+
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(Error::LoanNotFound)?;
+
+        if loan.status != LoanStatus::Active {
+            return Err(Error::LoanAlreadyClosed);
+        }
+
+        let int_fee_bps: u32 = env.storage().instance().get(&INT_FEE).unwrap_or(1000);
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(loan.last_interest_time);
+
+        if elapsed == 0 || loan.outstanding == 0 {
+            return Ok(0);
+        }
+
+        let accrued = loan.outstanding
+            .checked_mul(int_fee_bps as i128)
+            .unwrap_or(i128::MAX)
+            .checked_mul(elapsed as i128)
+            .unwrap_or(i128::MAX)
+            / (10_000i128 * 31_536_000i128);
+
+        loan.interest_accrued = loan.interest_accrued.saturating_add(accrued);
+        loan.last_interest_time = now;
+
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Loan(loan_id),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
+        Ok(accrued)
+    }
+
+    // ── recalculate_health_factor ─────────────────────────────────────────
+    /// Recompute the health factor for `loan_id` using the latest oracle price
+    /// and update the stored `total_collateral_value` accordingly (issue #1040).
+    ///
+    /// When the new health factor drops below 10 000 (i.e. HF < 1.0) the
+    /// function emits a `LoanAtRisk` event so off-chain listeners can react.
+    ///
+    /// Returns the newly computed health factor (scaled by 10 000).
+    pub fn recalculate_health_factor(env: Env, loan_id: u64) -> Result<i128, Error> {
+        Self::assert_initialized(&env)?;
+
+        // Require a fresh oracle price.
+        let last_price: i128 = env.storage().instance().get(&LAST_PRICE).unwrap_or(0);
+        let last_price_time: u64 = env.storage().instance().get(&LAST_PRICE_TIME).unwrap_or(0);
+        let stale_threshold: u64 = env.storage().instance().get(&STALE_THR).unwrap_or(3600);
+        let now = env.ledger().timestamp();
+
+        if last_price <= 0 || now.saturating_sub(last_price_time) > stale_threshold {
+            return Err(Error::InvalidPrice);
+        }
+
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(Error::LoanNotFound)?;
+
+        if loan.status != LoanStatus::Active {
+            return Err(Error::LoanAlreadyClosed);
+        }
+
+        // Re-sum the current appraised values of all collaterals backing this loan.
+        let new_collateral_value: i128 = {
+            let mut total: i128 = 0;
+            for col_id in loan.collateral_ids.iter() {
+                if let Some(col) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, CollateralRecord>(&DataKey::Collateral(col_id))
+                {
+                    total = total
+                        .checked_add(col.appraised_value)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                }
+            }
+            total
+        };
+        loan.total_collateral_value = new_collateral_value;
+
+        let liq_thr: u32 = env.storage().instance().get(&LIQ_THR).unwrap();
+        let hf = Self::compute_health_factor_with_thr(&loan, liq_thr)?;
+
+        // Update rolling hf_history (cap = 5).
+        const HF_HISTORY_CAP: u32 = 5;
+        if loan.hf_history.len() >= HF_HISTORY_CAP {
+            let mut new_hist = Vec::new(&env);
+            let start = loan.hf_history.len() - (HF_HISTORY_CAP - 1);
+            for i in start..loan.hf_history.len() {
+                new_hist.push_back(loan.hf_history.get(i).unwrap());
+            }
+            loan.hf_history = new_hist;
+        }
+        loan.hf_history.push_back(hf);
+
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Loan(loan_id),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
+        // Emit LoanAtRisk when health factor drops below 1.0 (< 10 000).
+        if hf < 10_000 {
+            env.events().publish(
+                (Symbol::new(&env, "LoanAtRisk"),),
+                (loan_id, loan.borrower.clone(), hf, last_price),
+            );
+        }
+
+        Ok(hf)
     }
 
     // ── migrate_storage ───────────────────────────────────────────────────

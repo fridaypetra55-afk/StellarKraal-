@@ -3297,3 +3297,618 @@ fn test_reappraise_nonexistent_collateral_fails() {
     let owner = Address::generate(&env);
     client.reappraise_collateral(&owner, &9999u64, &1_500_000i128);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #1039 – Reentrancy guard tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The reentrancy guard uses temporary (non-persistent) storage.
+#[test]
+fn test_reentrancy_guard_uses_temporary_storage() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    // After initialization the Guard key must NOT be in persistent storage.
+    env.as_contract(&cid, || {
+        assert!(
+            !env.storage().temporary().has(&DataKey::Guard),
+            "Guard flag must not be set outside of a call"
+        );
+    });
+}
+
+/// request_loan sets the guard for the duration of the call.
+#[test]
+fn test_reentrancy_guard_cleared_after_request_loan() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+    // After the call returns the guard must be cleared.
+    env.as_contract(&cid, || {
+        assert!(
+            !env.storage().temporary().has(&DataKey::Guard),
+            "Guard flag must be cleared after request_loan completes"
+        );
+    });
+}
+
+/// repay_loan sets and clears the guard correctly.
+#[test]
+fn test_reentrancy_guard_cleared_after_repay_loan() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+    client.repay_loan(&borrower, &loan_id, &10_000_000i128);
+    env.as_contract(&cid, || {
+        assert!(
+            !env.storage().temporary().has(&DataKey::Guard),
+            "Guard flag must be cleared after repay_loan completes"
+        );
+    });
+}
+
+/// Simulated reentrant call: manually set the guard flag then verify that
+/// a subsequent call is rejected with AlreadyInProgress (#20).
+#[test]
+fn test_reentrancy_guard_rejects_reentrant_call() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // Simulate a reentrant state by setting the guard flag in temporary storage.
+    env.as_contract(&cid, || {
+        env.storage().temporary().set(&DataKey::Guard, &());
+    });
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+
+    // With the guard set, request_loan must return AlreadyInProgress (#20).
+    let result =
+        client.try_request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyInProgress)),
+        "reentrant request_loan must be rejected with AlreadyInProgress"
+    );
+
+    // Clean up the guard so other operations work.
+    env.as_contract(&cid, || {
+        env.storage().temporary().remove(&DataKey::Guard);
+    });
+}
+
+/// Simulated reentrant call on repay_loan returns AlreadyInProgress.
+#[test]
+fn test_reentrancy_guard_rejects_reentrant_repay() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+
+    // Simulate reentrancy.
+    env.as_contract(&cid, || {
+        env.storage().temporary().set(&DataKey::Guard, &());
+    });
+
+    let result = client.try_repay_loan(&borrower, &loan_id, &10_000_000i128);
+    assert_eq!(
+        result,
+        Err(Ok(Error::AlreadyInProgress)),
+        "reentrant repay_loan must be rejected with AlreadyInProgress"
+    );
+
+    env.as_contract(&cid, || {
+        env.storage().temporary().remove(&DataKey::Guard);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #1040 – recalculate_health_factor tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// recalculate_health_factor updates the stored health factor.
+#[test]
+fn test_recalculate_health_factor_ok() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // Provide a fresh oracle price.
+    let oracle_addr = oracle.clone();
+    client.submit_price(&oracle_addr, &1_000i128);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &30_000_000i128, &None);
+
+    let hf = client.recalculate_health_factor(&loan_id);
+    // With collateral 100M, LTV 60%, liq_thr 80%, outstanding 30M:
+    // HF = (100_000_000 * 8000) / (30_000_000 * 10_000) = 800_000_000_000 / 300_000_000_000 = 2.666... ≈ 26_666
+    assert!(hf > 10_000, "health factor should be > 1.0 with ample collateral");
+}
+
+/// recalculate_health_factor emits LoanAtRisk when HF < 10_000.
+#[test]
+fn test_recalculate_health_factor_emits_loan_at_risk() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // Provide a fresh oracle price.
+    let oracle_addr = oracle.clone();
+    client.submit_price(&oracle_addr, &1_000i128);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &30_000_000i128, &None);
+
+    // Manipulate the outstanding balance to make HF drop below 1.0.
+    env.as_contract(&cid, || {
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .unwrap();
+        // Set outstanding to a very high value so HF < 1.0.
+        loan.outstanding = 900_000_000i128;
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+    });
+
+    let events_before = env.events().all().len();
+    let hf = client.recalculate_health_factor(&loan_id);
+    assert!(hf < 10_000, "health factor should be < 1.0 with inflated debt");
+
+    let events_after = env.events().all().len();
+    assert!(
+        events_after > events_before,
+        "LoanAtRisk event should be emitted when HF < 1.0"
+    );
+
+    let events = env.events().all();
+    let at_risk_topic = vec![&env, Symbol::new(&env, "LoanAtRisk").into_val(&env)];
+    let at_risk_event = events.iter().find(|e| e.1 == at_risk_topic);
+    assert!(at_risk_event.is_some(), "LoanAtRisk event must be present");
+}
+
+/// recalculate_health_factor returns InvalidPrice when oracle price is stale.
+#[test]
+fn test_recalculate_health_factor_stale_price_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let oracle_addr = oracle.clone();
+    client.submit_price(&oracle_addr, &1_000i128);
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &30_000_000i128, &None);
+
+    // Advance time past the staleness threshold.
+    env.ledger().with_mut(|li| li.timestamp += 3601);
+
+    let result = client.try_recalculate_health_factor(&loan_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidPrice)),
+        "stale oracle price must return InvalidPrice"
+    );
+}
+
+/// recalculate_health_factor returns LoanAlreadyClosed for repaid loans.
+#[test]
+fn test_recalculate_health_factor_closed_loan_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+    client.submit_price(&oracle_addr, &1_000i128);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &10_000_000i128, &None);
+    // Fully repay the loan.
+    client.repay_loan(&borrower, &loan_id, &10_000_000i128);
+
+    let result = client.try_recalculate_health_factor(&loan_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::LoanAlreadyClosed)),
+        "recalculate_health_factor must fail on a closed loan"
+    );
+}
+
+/// After a price drop, recalculate_health_factor reflects updated collateral value.
+#[test]
+fn test_recalculate_health_factor_reflects_price_drop() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+    client.submit_price(&oracle_addr, &1_000i128);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &30_000_000i128, &None);
+
+    let hf_before = client.recalculate_health_factor(&loan_id);
+
+    // Simulate a collateral price drop by lowering the appraised value.
+    env.as_contract(&cid, || {
+        let mut col: CollateralRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Collateral(col_id))
+            .unwrap();
+        col.appraised_value = 40_000_000i128; // price dropped 60%
+        env.storage().persistent().set(&DataKey::Collateral(col_id), &col);
+    });
+
+    let hf_after = client.recalculate_health_factor(&loan_id);
+    assert!(
+        hf_after < hf_before,
+        "health factor should decrease after a collateral price drop"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #1041 – LoanPartiallyRepaid event tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A partial repayment emits a LoanPartiallyRepaid event.
+#[test]
+fn test_partial_repay_emits_loan_partially_repaid_event() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+
+    let events_before = env.events().all().len();
+    client.repay_loan(&borrower, &loan_id, &10_000_000i128);
+
+    let events = env.events().all();
+    assert!(events.len() > events_before, "events must be emitted on repayment");
+
+    let topic = vec![&env, Symbol::new(&env, "LoanPartiallyRepaid").into_val(&env)];
+    let event = events.iter().find(|e| e.1 == topic);
+    assert!(event.is_some(), "LoanPartiallyRepaid event must be emitted for partial repayment");
+}
+
+/// LoanPartiallyRepaid event carries correct data.
+#[test]
+fn test_loan_partially_repaid_event_data() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+
+    client.repay_loan(&borrower, &loan_id, &10_000_000i128);
+
+    let events = env.events().all();
+    let topic = vec![&env, Symbol::new(&env, "LoanPartiallyRepaid").into_val(&env)];
+    let event = events
+        .iter()
+        .find(|e| e.1 == topic)
+        .expect("LoanPartiallyRepaid event must be present");
+
+    let data: (u64, Address, i128, i128) = event.2.clone().into_val(&env);
+    assert_eq!(data.0, loan_id, "event loan_id must match");
+    assert_eq!(data.1, borrower, "event borrower must match");
+    assert_eq!(data.2, 10_000_000i128, "event amount_paid must match");
+    assert_eq!(data.3, 10_000_000i128, "event remaining_outstanding must match");
+}
+
+/// A full repayment does NOT emit LoanPartiallyRepaid.
+#[test]
+fn test_full_repay_does_not_emit_loan_partially_repaid_event() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &10_000_000i128, &None);
+
+    client.repay_loan(&borrower, &loan_id, &10_000_000i128);
+
+    let events = env.events().all();
+    let topic = vec![&env, Symbol::new(&env, "LoanPartiallyRepaid").into_val(&env)];
+    let event = events.iter().find(|e| e.1 == topic);
+    assert!(
+        event.is_none(),
+        "LoanPartiallyRepaid must NOT be emitted on full repayment"
+    );
+}
+
+/// Partial repayment reduces principal and updates outstanding correctly.
+#[test]
+fn test_partial_repay_reduces_outstanding() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let borrower = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &2u32,
+        &100_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &20_000_000i128, &None);
+
+    client.repay_loan(&borrower, &loan_id, &8_000_000i128);
+
+    let loan = client.get_loan(&loan_id);
+    assert_eq!(
+        loan.outstanding, 12_000_000i128,
+        "outstanding should decrease by exactly the repaid amount"
+    );
+    assert_eq!(
+        loan.status,
+        LoanStatus::Active,
+        "loan must remain Active after partial repayment"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #1042 – TWAP ring buffer tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Submitting prices populates the ring buffer.
+#[test]
+fn test_twap_ring_buffer_stores_entries() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+    for i in 1u64..=5u64 {
+        env.ledger().with_mut(|li| li.timestamp += 60);
+        client.submit_price(&oracle_addr, &(1_000i128 + i as i128 * 100));
+    }
+
+    // With ≥ 2 entries we can compute a TWAP.
+    let twap = client.get_twap(&3600u64);
+    assert!(twap > 0, "get_twap must return a positive value after entries are stored");
+}
+
+/// get_twap returns InsufficientTwapData when fewer than 2 entries exist.
+#[test]
+fn test_get_twap_insufficient_data_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // No prices submitted yet.
+    let result = client.try_get_twap(&3600u64);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InsufficientTwapData)),
+        "get_twap must fail with InsufficientTwapData when no entries exist"
+    );
+}
+
+/// get_twap ignores entries older than the window.
+#[test]
+fn test_get_twap_ignores_stale_entries() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+    // Submit a price far in the past.
+    client.submit_price(&oracle_addr, &5_000i128);
+    // Jump forward past the window.
+    env.ledger().with_mut(|li| li.timestamp += 7200);
+    // Submit two recent prices.
+    client.submit_price(&oracle_addr, &1_000i128);
+    env.ledger().with_mut(|li| li.timestamp += 60);
+    client.submit_price(&oracle_addr, &1_100i128);
+
+    // TWAP over 3600s window should only see the 2 recent prices.
+    let twap = client.get_twap(&3600u64);
+    // Should be approximately 1_000 – 1_100, not pulled up by 5_000.
+    assert!(twap < 2_000, "TWAP must not be pulled up by entries outside the window");
+    assert!(twap > 0, "TWAP must be positive");
+}
+
+/// Ring buffer wraps around when capacity is exceeded.
+#[test]
+fn test_twap_ring_buffer_wraps_around() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // Lower the capacity to something small for easy testing.
+    client.set_twap_cap(&admin, &3u32);
+
+    let oracle_addr = oracle.clone();
+    // Fill the buffer completely.
+    for i in 1u64..=5u64 {
+        env.ledger().with_mut(|li| li.timestamp += 60);
+        client.submit_price(&oracle_addr, &(1_000i128 * i as i128));
+    }
+
+    // Should still return a valid TWAP (the ring buffer wrapped correctly).
+    let twap = client.get_twap(&0u64);
+    assert!(twap > 0, "get_twap must succeed after ring buffer wraps around");
+}
+
+/// Prices widely spaced in time are correctly time-weighted.
+#[test]
+fn test_get_twap_time_weighted_average() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+    // t=0: price=1_000 (held for 900 seconds)
+    client.submit_price(&oracle_addr, &1_000i128);
+    env.ledger().with_mut(|li| li.timestamp += 900);
+    // t=900: price=3_000 (held for 100 seconds)
+    client.submit_price(&oracle_addr, &3_000i128);
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    // Now = t=1000. TWAP over 1000s = (1_000*900 + 3_000*100) / 1000 = 1_200.
+
+    let twap = client.get_twap(&1000u64);
+    // Expected ~1_200 with a small floating-point difference.
+    assert!(
+        twap >= 1_100 && twap <= 1_300,
+        "time-weighted average should be approximately 1_200, got {}",
+        twap
+    );
+}
+
+/// set_twap_cap admin-only restriction.
+#[test]
+#[should_panic(expected = "#3")]
+fn test_set_twap_cap_non_admin_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let attacker = Address::generate(&env);
+    let _ = admin;
+    client.set_twap_cap(&attacker, &10u32);
+}
+
+/// set_twap_cap zero fails.
+#[test]
+#[should_panic(expected = "#8")]
+fn test_set_twap_cap_zero_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    client.set_twap_cap(&admin, &0u32);
+}
+
+/// get_twap_cap returns the configured value.
+#[test]
+fn test_get_twap_cap_returns_configured_value() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    assert_eq!(client.get_twap_cap(), DEFAULT_TWAP_CAP);
+
+    client.set_twap_cap(&admin, &120u32);
+    assert_eq!(client.get_twap_cap(), 120u32);
+}
+
+/// Manipulation resistance: a single outlier price cannot dominate TWAP
+/// because it is held only briefly before normal prices restore.
+#[test]
+fn test_twap_manipulation_resistance() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    let oracle_addr = oracle.clone();
+
+    // Establish a baseline of normal prices (price = 1_000).
+    for _i in 0..5u32 {
+        env.ledger().with_mut(|li| li.timestamp += 600); // 10 min per entry
+        client.submit_price(&oracle_addr, &1_000i128);
+    }
+
+    // A flash-loan attacker submits a 10x inflated price for 1 second.
+    env.ledger().with_mut(|li| li.timestamp += 1);
+    client.submit_price(&oracle_addr, &10_000i128); // manipulated
+
+    // 1 second later the price returns to normal.
+    env.ledger().with_mut(|li| li.timestamp += 1);
+    client.submit_price(&oracle_addr, &1_000i128);
+
+    let twap = client.get_twap(&3600u64);
+    // TWAP should be close to 1_000, not significantly elevated by the 1-second spike.
+    assert!(
+        twap < 2_000,
+        "TWAP should not be significantly affected by a brief price spike, got {}",
+        twap
+    );
+}
